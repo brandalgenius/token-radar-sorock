@@ -11,9 +11,10 @@
 // age), are fitted and measured on the same five disjoint folds; each moves held-out error by less
 // than 0.02 log units, so neither is retained and neither can move a score. The whole pipeline is
 // refitted per fold, so the reported error and the reported residual band are out of sample; the
-// band's coverage is measured (about 71%), never asserted as 80%. A thin category's band is widened
-// toward the standard error of its own median, so 3 peers never look as certain as 40. Category
-// effects borrow strength globally. This model cannot know future circulating supply, FDV, airdrop
+// band's coverage is measured on the same function that draws each row (78% here), never asserted as 80%.
+// A thin category's band is widened
+// toward the standard error of its own median, so 3 peers never look as certain as 40. A category
+// under three peers contributes no effect at all: the row is priced by TVL alone and says so. This model cannot know future circulating supply, FDV, airdrop
 // eligibility or a payout.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
@@ -474,6 +475,11 @@ function predictLogRatio(p: SnapshotProtocol, fit: PeerFit, withCategory = true)
   return fit.intercept + fit.features.reduce((sum, k) => sum + fit.weights[k] * featureValue(p, k, fit), 0) + effect;
 }
 
+/** One protocol's log multiple exactly as production prices it: the category effect only with a cohort. */
+function estimateLog(p: SnapshotProtocol, fit: PeerFit, constants: ModelConstants): number {
+  return predictLogRatio(p, fit, hasCohort(p, fit, constants));
+}
+
 /** Whether a row's own category is thick enough for its effect to be used and claimed. */
 function hasCohort(p: SnapshotProtocol, fit: PeerFit, constants: ModelConstants): boolean {
   if (fit.categoryEffects.size === 0) return false;
@@ -528,7 +534,7 @@ function crossValidate(
     const testing = peers.filter((_,i) => i%folds === fold);
     const f = train(training, asOf, constants, features, withCategory);
     for (const p of testing) {
-      const residual = Math.log((p.mcap_usd as number)/p.tvl_usd) - predictLogRatio(p, f);
+      const residual = Math.log((p.mcap_usd as number)/p.tvl_usd) - estimateLog(p, f, constants);
       const band = bandFor(p, f, constants);
       error += Math.abs(residual);
       if (residual >= band.low && residual <= band.high) covered++;
@@ -591,7 +597,7 @@ export function estimate(
   const key = p.category ?? 'Unclassified';
   const usedCategory = hasCohort(p, fit, constants);
   const count = fit.categoryCount.get(key) ?? 0;
-  const logMultiple = predictLogRatio(p, fit, usedCategory);
+  const logMultiple = estimateLog(p, fit, constants);
   const multiple = Math.exp(logMultiple);
   const implied = Math.max(1, Math.round(p.tvl_usd * multiple));
   const band = bandFor(p, fit, constants);

@@ -28,12 +28,45 @@ test('a category below min_peers is priced without its effect and says so', () =
   const lending = preToken(peers[0]!);
   const le = estimate(lending, fit);
   assert.equal(le.usedCategory, true);
-  assert(le.peerBasis, 'Lending');
+  assert.equal(le.peerBasis, 'Lending');
+  assert.equal(e.logMultiple, estimate({ ...rare, category: 'Unseen' }, fit).logMultiple,
+    'a thin category must price exactly like an unseen category at the same TVL');
+  assert.notEqual(le.logMultiple, estimate({ ...lending, category: 'Unseen' }, fit).logMultiple,
+    'a thick category still contributes its fitted effect');
   assert(e.multiple < 40, `a one-peer category must not carry its own 40x median, got ${e.multiple}`);
   // ...and its range must be wider than a thick category's, for the missing cohort.
   const thick = bandFor(lending, fit);
   const thin = bandFor(rare, fit);
   assert(thin.high - thin.low > thick.high - thick.low, 'a thin category needs a wider band');
+});
+
+test('held-out error and coverage use the exact production estimator, including thin-category fallback', () => {
+  // Two peers per category leave one or two in each training fold, below the three-peer minimum.
+  const sparse = {
+    ...snapshot,
+    protocols: peers.map((p, i) => ({ ...p, category: `Thin ${Math.floor(i / 2)}` })),
+  };
+  const fit = fitPeers(sparse);
+  const folds = fit.calibration.folds;
+  let error = 0, covered = 0, evaluated = 0;
+  for (let fold = 0; fold < folds; fold++) {
+    const training = fit.peers.filter((_, i) => i % folds !== fold);
+    const testing = fit.peers.filter((_, i) => i % folds === fold);
+    const trained = fitPeers({ ...sparse, protocols: training });
+    for (const p of testing) {
+      const e = estimate(p, trained);
+      const residual = Math.log((p.mcap_usd as number) / p.tvl_usd) - e.logMultiple;
+      const band = bandFor(p, trained);
+      error += Math.abs(residual);
+      if (residual >= band.low && residual <= band.high) covered++;
+      assert.equal(e.low, Math.max(1, Math.round(p.tvl_usd * Math.exp(e.logMultiple + band.low))));
+      assert.equal(e.high, Math.max(2, Math.round(p.tvl_usd * Math.exp(e.logMultiple + band.high))));
+      evaluated++;
+    }
+  }
+  assert(Math.abs(fit.calibration.log_mae - error / evaluated) < 1e-12,
+    `reported MAE ${fit.calibration.log_mae} differs from production ${error / evaluated}`);
+  assert.equal(fit.calibration.interval_coverage, covered / evaluated);
 });
 
 test('the reported baseline is one global median multiple, with no category effect', () => {
