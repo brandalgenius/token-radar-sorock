@@ -10,7 +10,7 @@ SIGNAL is a pre-token launch radar: it screens a sealed protocol snapshot for pr
 
 ```sh
 mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
-node --test tests/*.test.ts
+SIGNAL_SNAPSHOT=../input/snapshot.json node --test tests/*.test.ts
 ```
 
 Node 22.18+ runs `main.ts` directly; there is no build step and no dependency in `package.json`. The program writes `board.json`, `data.js`, `dashboard/`, `screenshots/` and `dossier.json` under the output directory.
@@ -18,17 +18,18 @@ Node 22.18+ runs `main.ts` directly; there is no build step and no dependency in
 The optional browser check needs Playwright, which the submitted program never imports:
 
 ```sh
-PLAYWRIGHT_MODULE=/path/to/playwright/index.mjs node tests/browser.mjs
+npm i --no-save playwright && node tests/browser.mjs
 ```
 
 ## What it computes
 
 `log(mcap / TVL) = intercept + weight × log10(TVL) + shrunk category effect`, fitted by ridge regression on the 119 protocols in the snapshot that already record a token. A protocol's own market cap never enters its own estimate.
 
-- **Five disjoint folds.** Every peer's cap is held out once, and the whole pipeline — weights, category effects, residual band — is refitted per fold. The reported log MAE (1.56) is out of sample against a 1.78 baseline, which is one global median multiple.
+- **Five disjoint folds.** Every peer's cap is held out once, and the whole pipeline — weights, category effects, residual band — is refitted per fold. The reported log MAE (1.56) is out of sample against 1.79 for one global median multiple, refitted on each fold's training peers with no feature and no category term.
 - **Features are measured, not assumed.** The clamped seven-day change and log10(tracking age) are each added to the fit and scored the same way; they move held-out error by +0.001 and +0.015 log units, under the 0.02 the model treats as material, so neither is retained and neither can move a score. `tests/features.test.ts` pins that rule.
-- **The band is a measured residual band**, not a promise: training-residual p10/p90, covering 71% of held-out peers, and widened by the standard error of a thin category's median so a three-peer category never looks as certain as a forty-peer one.
-- **Thin categories are labelled.** Below three peers a row falls back to the pooled band and says so; `confidence` stays Low while the band is wide.
+- **The band is a measured residual band**, not a promise: the fitted ten-to-ninetieth residual band, widened by the standard error of a thin category's median, covering 78% of held-out peers. The same function draws every row's range, so the coverage number describes the range a reader actually sees.
+- **Thin categories are priced honestly.** A category with fewer than three peers contributes no effect: the row is priced by TVL alone, its evidence line says so with the count, and its range is widened for the missing cohort. `confidence` stays Low while the band is wide.
+- **Every screened protocol is accounted for.** Board rows plus the excluded buckets — token-bearing, asset products, versioned releases, unranked — add up to the snapshot's 758 protocols. Watchlist slugs that the rankable rule drops stay on the board flagged as coverage only.
 
 ## What it refuses to claim
 

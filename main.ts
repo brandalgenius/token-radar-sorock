@@ -88,7 +88,7 @@ writeFileSync(
 );
 
 process.stdout.write(
-  `signal: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows ranked (${radar.early_size} early), ` +
+  `signal: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows ranked (${board.filter((r) => r.tvl_usd < snapshot.floor_usd && !snapshot.watchlist.includes(r.slug)).length} below the floor), ` +
     `${radar.calibration.peer_count} peers fitted, held-out log MAE ${radar.calibration.log_mae.toFixed(3)} vs ${radar.calibration.baseline_log_mae.toFixed(3)} baseline\n` +
     `signal: wrote board.json, data.js, dashboard/ (${dash.length} files), screenshots/ (${shots.length} images) and dossier.json to ${out}\n`,
 );

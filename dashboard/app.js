@@ -60,7 +60,7 @@
         '<div class="stat"><dt>Protocols screened</dt><dd>' + D.universe + '<small>sealed universe</small></dd></div>' +
         '<div class="stat"><dt>Launch candidates</dt><dd>' + D.rows.length + '<small>ranked, not endorsed</small></dd></div>' +
         '<div class="stat"><dt>Watchlist covered</dt><dd>' + D.watchlist_size + ' / ' + D.watchlist_size + '<small>all retained</small></dd></div>' +
-        '<div class="stat"><dt>Early discoveries</dt><dd>' + D.rows.filter(function (r) { return !r.watchlist; }).length + '<small>below the $50M floor</small></dd></div>' }),
+        '<div class="stat"><dt>Early discoveries</dt><dd>' + D.rows.filter(function (r) { return !r.watchlist && r.tvl_usd < D.floor_usd; }).length + '<small>below the $' + Math.round(D.floor_usd / 1e6) + 'M floor</small></dd></div>' }),
     ]);
   }
 
@@ -147,7 +147,7 @@
       el('span', { class: 'count', 'aria-live': 'polite', html: '<b>' + rows.length + '</b> candidates · ' + (rows.length ? state.page * PAGE + 1 : 0) + '–' + Math.min((state.page + 1) * PAGE, rows.length) }),
     ]));
 
-    var cols = [['rank', '#'], ['name', 'Protocol / route'], ['implied_value_usd', 'Conditional cap'], ['tvl_usd', 'TVL'], ['change_7d', '7d TVL'], ['peer_count', 'Evidence'], ['cost', 'Cost / capital']];
+    var cols = [['rank', '#'], ['name', 'Protocol / route'], ['implied_value_usd', 'Conditional cap'], ['tvl_usd', 'TVL'], ['change_7d', 'TVL 7d %'], ['peer_count', 'Evidence'], ['cost', 'Gas · capital']];
     var head = el('tr');
     cols.forEach(function (c) {
       var th = el('th', { scope: 'col', class: ['implied_value_usd', 'tvl_usd', 'change_7d', 'peer_count', 'cost'].indexOf(c[0]) >= 0 ? 'r' : '' });
@@ -164,7 +164,7 @@
         '<td class="rank">' + String(r.rank).padStart(2, '0') + '</td>' +
         '<td class="who"><button class="protocol" data-open="' + esc(r.slug) + '">' + esc(r.name) + ' <span aria-hidden="true">↗</span></button>' +
         '<div class="sub">' + esc(r.category || 'Unclassified') + ' · ' + esc(r.chains.slice(0, 2).join(' + ') || 'chain unknown') + '</div>' +
-        '<div class="sub">' + chip(r.watchlist ? 'WATCHLIST' : 'EARLY', r.watchlist ? 'watch' : 'early') + chip(r.route, r.route === 'Curated vault' ? 'vault' : r.route === 'Check terms' ? 'terms' : '') + '</div></td>' +
+        '<div class="sub">' + chip(r.watchlist ? 'WATCHLIST' : r.tvl_usd < D.floor_usd ? 'EARLY · BELOW FLOOR' : 'ABOVE FLOOR', r.watchlist ? 'watch' : 'early') + chip(r.route, r.route === 'Curated vault' ? 'vault' : r.route === 'Check terms' ? 'terms' : '') + (r.product_of_another ? chip('PRODUCT: COVERAGE ONLY', 'terms') : '') + '</div></td>' +
         '<td class="val"><div class="big">' + money(r.implied_value_usd) + '</div><div class="band">' + money(r.low_usd) + ' – ' + money(r.high_usd) + '</div></td>' +
         '<td class="num val">' + money(r.tvl_usd) + '</td>' +
         '<td class="num ' + (r.change_7d === null ? 'flat' : r.change_7d >= 0 ? 'up' : 'down') + '">' + pct(r.change_7d) + '</td>' +
@@ -190,8 +190,8 @@
   function method() {
     var c = D.calibration;
     var cards = [
-      ['01 / Universe', D.universe + ' screened', D.excluded.token + ' protocols already record a token and ' + (D.excluded.token ? '' : '') + 'are separated as peers; ' + (D.excluded.product + D.excluded.release) + ' are asset products or versioned releases and never counted as launches. Parent-protocol data is absent from the snapshot, so below-floor inclusion is provisional.'],
-      ['02 / Peer engine', c.peer_count + ' token peers', 'Ridge ' + c.ridge + ' on log10(TVL), coefficient ' + c.weights.tvl.toFixed(3) + '. Growth and tracking age were measured and rejected: each moves held-out error by under ' + c.material_delta + ' log units. Category residuals shrink by ' + c.shrink + ' observations, and every fold re-fits the pipeline.'],
+      ['01 / Universe', D.universe + ' screened', D.excluded.token + ' protocols already record a token and are separated as peers; ' + D.excluded.product + ' are products of another asset and ' + D.excluded.release + ' are versioned releases, neither counted as a launch; ' + D.excluded.other + ' pre-token protocols stay unranked. Every other pre-token protocol is ranked, above and below the $' + Math.round(D.floor_usd / 1e6) + 'M floor.'],
+      ['02 / Peer engine', c.peer_count + ' token peers', 'Ridge ' + c.ridge + ' on log10(TVL), coefficient ' + c.weights.tvl.toFixed(3) + '. Growth and tracking age were measured and rejected: each moves held-out error by under ' + c.material_delta + ' log units. A category effect applies only where the category has ' + c.min_peers + ' peers of its own; below that the row is priced by TVL alone, says so, and its range widens. Effects shrink by ' + c.shrink + ' observations and every fold re-fits the pipeline.'],
       ['03 / Held-out check', Number(c.log_mae).toFixed(2) + ' log MAE', 'Global baseline ' + Number(c.baseline_log_mae).toFixed(2) + ' over ' + c.folds + ' disjoint folds. The fitted residual band covers ' + (c.interval_coverage * 100).toFixed(0) + '% of held-out token peers. That measures the model, not a future launch.'],
       ['04 / Reality check', 'Not a launch forecast', 'Market cap is not FDV and not your allocation. Ten snapshot fields cannot establish a token, a date, eligibility, fees or incentives. Every feature is a snapshot figure; none is a promise, revalidate before acting.'],
     ];
@@ -224,7 +224,7 @@
         '<div><dt>Tracked since</dt><dd>' + (r.listed_at === null ? 'unrecorded' : esc(r.listed_at) + ' · ' + r.age_days + 'd') + '</dd></div>' +
       '</div>' +
       '<div class="formula"><div class="eq">' + money(r.tvl_usd) + ' TVL × ' + r.multiple.toFixed(3) + ' peer-adjusted multiple = ' + money(r.implied_value_usd) + ' conditional value</div>' +
-      '<p class="cap">' + r.peer_count + (r.peer_basis === 'all token peers' ? ' token peers, global pool' : ' peers in ' + esc(r.peer_basis)) + ' · ' + esc(r.confidence) + ' confidence. TVL is not revenue; market cap is not FDV.</p></div>' }));
+      '<p class="cap">' + r.peer_count + (r.peer_basis === 'all token peers, no cohort' ? ' token peers price this by TVL alone; its own category is under the ' + D.calibration.min_peers + '-peer minimum, so the range is widened' : ' peers in ' + esc(r.peer_basis)) + ' · ' + esc(r.confidence) + ' confidence. TVL is not revenue; market cap is not FDV.</p></div>' }));
 
     left.append(el('section', { class: 'card', html:
       '<h3>Valuation comparables</h3><p class="hint">' + esc(r.peer_basis) + ' · nearest by TVL first: observed market caps, nothing modelled</p>' +

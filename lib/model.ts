@@ -58,6 +58,7 @@ export interface Calibration {
   interval_coverage: number;
   shrink: number;
   ridge: number;
+  min_peers: number;
   weights: Record<Feature, number>;
   category_count: number;
   median_multiple: number;
@@ -250,13 +251,16 @@ export interface BoardRow {
   symbol: null;
   token_status: 'pre-token';
   age_days: number | null;
+  /** True when the category or the name marks a product of another asset, kept only for watchlist coverage. */
+  product_of_another: boolean;
   implied_value_usd: number;
   implied_range_usd: { low: number; high: number };
   route: 'Direct protocol' | 'Curated vault' | 'Check terms';
-  confidence: 'Low' | 'Moderate';
+  confidence: 'Low';
   model: {
     multiple: number;
     peer_count: number;
+    cohort_size: number;
     peer_category: string;
     log_multiple: number;
     residual_band: number;
@@ -276,6 +280,7 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   watchlist: boolean;
+  product_of_another: boolean;
   route: 'Direct protocol' | 'Curated vault' | 'Check terms';
   access: string;
   implied_value_usd: number;
@@ -284,7 +289,7 @@ export interface RadarRow {
   peer_count: number;
   multiple: number;
   peer_basis: string;
-  confidence: 'Low' | 'Moderate';
+  confidence: 'Low';
   evidence: string[];
   farm_steps: string[];
   farm: {
@@ -324,18 +329,22 @@ export class SnapshotError extends Error {
   }
 }
 
-/** One feature the model can use, and the one it retains: TVL alone carries the signal. */
+/** One feature the model can use; only TVL is retained, and only if it earns its place. */
 export type Feature = 'tvl' | 'growth' | 'age';
 const FEATURES: readonly Feature[] = ['tvl', 'growth', 'age'];
 /** A feature is kept only when adding it moves held-out error by at least this much (log units). */
 const MATERIAL_DELTA = 0.02;
 const RETAINED: readonly Feature[] = ['tvl'];
+/** A normal's 10-90 half range is 1.2816 sigma; a median's standard error is 1.253 sigma / sqrt(n). */
+const HALF_TO_SIGMA = 1.2816;
+const MEDIAN_SE = 1.253;
 
 /**
- * A peer model whose feature is the snapshot's own TVL: log10(TVL), ridge-penalised so one loud
- * protocol cannot dominate 119 observations. Growth and tracking age are measured, not assumed:
- * each is added to the fitted model and its out-of-sample effect is reported. Both fall under the
- * materiality threshold, so neither is retained and neither can move a score.
+ * The peer model. Its multiple is log10(TVL) with a shrunk category effect, and a category effect
+ * only applies where the category has at least `min_peers` peers of its own; below that a row is
+ * priced by TVL alone and its range is widened for the missing cohort, which the row then says.
+ * Growth and tracking age are fitted and measured on the same folds, reported with their measured
+ * effect, and retained only if they clear MATERIAL_DELTA.
  */
 interface PeerFit {
   intercept: number;
@@ -344,9 +353,9 @@ interface PeerFit {
   means: Record<Feature, number>;
   categoryEffects: Map<string, number>;
   categoryCount: Map<string, number>;
-  categoryBand: Map<string, number>;
   lowResidual: number;
   highResidual: number;
+  sigma: number;
   medianLogRatio: number;
   asOf?: string;
 }
@@ -403,8 +412,18 @@ function ridge(X: number[][], y: number[], lambda: number): number[] {
   return b;
 }
 
-/** Train log(mcap/TVL) on the given features, then add shrunk category residuals. */
-function train(peers: SnapshotProtocol[], asOf: string, constants: ModelConstants, features: readonly Feature[]): PeerFit {
+/**
+ * Train log(mcap/TVL) on the given features, then add median category residuals shrunk by `shrink`
+ * pseudo-observations. With withCategory false, no category effect is fitted at all: that is the
+ * one-global-multiple baseline the calibration reports against.
+ */
+function train(
+  peers: SnapshotProtocol[],
+  asOf: string,
+  constants: ModelConstants,
+  features: readonly Feature[],
+  withCategory = true,
+): PeerFit {
   const ys = peers.map(p => Math.log((p.mcap_usd as number) / p.tvl_usd));
   const avg = (ns: number[]) => ns.reduce((a,b) => a+b,0) / Math.max(1,ns.length);
   const rawAge = peers.map(p => ageDays(asOf, p.listed_at)).filter((v): v is number => v !== null);
@@ -422,55 +441,97 @@ function train(peers: SnapshotProtocol[], asOf: string, constants: ModelConstant
   const weights: Record<Feature, number> = { tvl: 0, growth: 0, age: 0 };
   keys.forEach((k, j) => { weights[k] = w[j] ?? 0; });
   const intercept = my - keys.reduce((sum, k) => sum + weights[k] * means[k], 0);
-  const buckets = new Map<string,number[]>();
-  peers.forEach((p,i) => {
-    const c = p.category ?? 'Unclassified';
-    const ns = buckets.get(c) ?? [];
-    ns.push(ys[i]! - (intercept + keys.reduce((sum,k) => sum + weights[k] * columns.get(k)![i]!, 0)));
-    buckets.set(c,ns);
-  });
-  const categoryEffects = new Map<string,number>();
-  const categoryCount = new Map<string,number>();
-  const categoryBand = new Map<string,number>();
-  const pooledResiduals = peers.map((p,i) => ys[i]! - (intercept + keys.reduce((sum,k) => sum + weights[k] * columns.get(k)![i]!, 0)));
-  const globalHalf = Math.max(0.05, (percentile(pooledResiduals,0.9) - percentile(pooledResiduals,0.1)) / 2);
-  // A normal's 10-90 half range is 1.2816 sigma; a median's standard error is 1.253 sigma / sqrt(n).
-  const sigma = globalHalf / 1.2816;
-  for (const [c,ns] of buckets) {
-    categoryEffects.set(c,median(ns)*ns.length/(ns.length+constants.shrink));
-    categoryCount.set(c,ns.length);
-    // The pooled band widened by the standard error of this category's median multiple, so a
-    // three-peer category is honestly wider than the pooled board instead of quietly as narrow.
-    const standardError = 1.253 * sigma / Math.sqrt(ns.length);
-    categoryBand.set(c, Math.min(3, Math.hypot(globalHalf, standardError)));
+  const linear = peers.map((_, i) => intercept + keys.reduce((sum, k) => sum + weights[k] * columns.get(k)![i]!, 0));
+  const categoryEffects = new Map<string, number>();
+  const categoryCount = new Map<string, number>();
+  if (withCategory) {
+    const buckets = new Map<string, number[]>();
+    peers.forEach((p, i) => {
+      const c = p.category ?? 'Unclassified';
+      const ns = buckets.get(c) ?? [];
+      ns.push(ys[i]! - linear[i]!);
+      buckets.set(c, ns);
+    });
+    for (const [c, ns] of buckets) {
+      categoryEffects.set(c, median(ns) * ns.length / (ns.length + constants.shrink));
+      categoryCount.set(c, ns.length);
+    }
   }
-  const f: PeerFit = {intercept,features,weights,means,categoryEffects,categoryCount,categoryBand,lowResidual:0,highResidual:0,medianLogRatio:median(ys),asOf};
-  const residuals = peers.map((p,i) => ys[i]! - predictLogRatio(p,f));
-  f.lowResidual = Math.min(-0.05,percentile(residuals,0.1));
-  f.highResidual = Math.max(0.05,percentile(residuals,0.9));
+  const f: PeerFit = {
+    intercept, features, weights, means, categoryEffects, categoryCount,
+    lowResidual: 0, highResidual: 0, sigma: 0, medianLogRatio: median(ys), asOf,
+  };
+  const residuals = peers.map((p, i) => ys[i]! - predictLogRatio(p, f));
+  f.lowResidual = Math.min(-0.05, percentile(residuals, 0.1));
+  f.highResidual = Math.max(0.05, percentile(residuals, 0.9));
+  f.sigma = Math.max(0.05, (f.highResidual - f.lowResidual) / 2) / HALF_TO_SIGMA;
   return f;
 }
 
-function predictLogRatio(p: SnapshotProtocol, fit: PeerFit): number {
-  return (
-    fit.intercept +
-    fit.features.reduce((sum, k) => sum + fit.weights[k] * featureValue(p, k, fit), 0) +
-    (fit.categoryEffects.get(p.category ?? 'Unclassified') ?? 0)
-  );
+/** The fitted log multiple for one protocol, with or without its category effect. */
+function predictLogRatio(p: SnapshotProtocol, fit: PeerFit, withCategory = true): number {
+  const effect = withCategory ? (fit.categoryEffects.get(p.category ?? 'Unclassified') ?? 0) : 0;
+  return fit.intercept + fit.features.reduce((sum, k) => sum + fit.weights[k] * featureValue(p, k, fit), 0) + effect;
 }
 
-/** Five-fold held-out log MAE of the whole pipeline for one feature set. */
-function crossValidate(peers: SnapshotProtocol[], asOf: string, constants: ModelConstants, features: readonly Feature[]): { mae: number; coverage: number; evaluated: number } {
+/** Whether a row's own category is thick enough for its effect to be used and claimed. */
+function hasCohort(p: SnapshotProtocol, fit: PeerFit, constants: ModelConstants): boolean {
+  if (fit.categoryEffects.size === 0) return false;
+  return (fit.categoryCount.get(p.category ?? 'Unclassified') ?? 0) >= constants.min_peers;
+}
+
+/**
+ * The range a row is shown: the fitted residual band, widened on both sides by the standard error of
+ * a thin category's median so a one-peer category never looks as certain as a full one. The same
+ * function measures the coverage the calibration reports, so the claim and the picture agree.
+ */
+export function bandFor(p: SnapshotProtocol, fit: PeerFit, constants: ModelConstants = MODEL): { low: number; high: number } {
+  let low = fit.lowResidual;
+  let high = fit.highResidual;
+  if (!hasCohort(p, fit, constants)) {
+    const n = Math.max(1, fit.categoryCount.get(p.category ?? 'Unclassified') ?? 0);
+    const extra = Math.min(1, MEDIAN_SE * fit.sigma / Math.sqrt(n));
+    low -= extra;
+    high += extra;
+  }
+  return { low, high };
+}
+
+/**
+ * The comparison the entry reports against: one global median multiple per fold, learned on the
+ * same training peers and applied to the same held-out ones, with no feature and no category term.
+ */
+function baselineMae(peers: SnapshotProtocol[], constants: ModelConstants): number {
+  const folds = Math.min(constants.folds, peers.length);
+  let error = 0, evaluated = 0;
+  for (let fold = 0; fold < folds; fold++) {
+    const training = peers.filter((_, i) => i % folds !== fold);
+    const testing = peers.filter((_, i) => i % folds === fold);
+    const m = median(training.map((p) => Math.log((p.mcap_usd as number) / p.tvl_usd)));
+    for (const p of testing) { error += Math.abs(Math.log((p.mcap_usd as number) / p.tvl_usd) - m); evaluated++; }
+  }
+  return error / Math.max(1, evaluated);
+}
+
+/** Five-fold held-out log MAE and band coverage of the whole pipeline for one feature set. */
+function crossValidate(
+  peers: SnapshotProtocol[],
+  asOf: string,
+  constants: ModelConstants,
+  features: readonly Feature[],
+  withCategory = true,
+): { mae: number; coverage: number; evaluated: number } {
   const folds = Math.min(constants.folds, peers.length);
   let error = 0, covered = 0, evaluated = 0;
   for (let fold = 0; fold < folds; fold++) {
     const training = peers.filter((_,i) => i%folds !== fold);
     const testing = peers.filter((_,i) => i%folds === fold);
-    const f = train(training, asOf, constants, features);
+    const f = train(training, asOf, constants, features, withCategory);
     for (const p of testing) {
       const residual = Math.log((p.mcap_usd as number)/p.tvl_usd) - predictLogRatio(p, f);
+      const band = bandFor(p, f, constants);
       error += Math.abs(residual);
-      if (residual >= f.lowResidual && residual <= f.highResidual) covered++;
+      if (residual >= band.low && residual <= band.high) covered++;
       evaluated++;
     }
   }
@@ -488,10 +549,11 @@ export function fitPeers(snapshot: Snapshot, constants: ModelConstants = MODEL):
     folds: Math.min(constants.folds, peers.length),
     evaluated: base.evaluated,
     log_mae: base.mae,
-    baseline_log_mae: crossValidate(peers, snapshot.as_of, constants, []).mae,
+    baseline_log_mae: baselineMae(peers, constants),
     interval_coverage: base.coverage,
     shrink: constants.shrink,
     ridge: constants.ridge,
+    min_peers: constants.min_peers,
     weights: full.weights,
     category_count: full.categoryCount.size,
     median_multiple: Math.exp(full.medianLogRatio),
@@ -524,28 +586,26 @@ export function estimate(
   logMultiple: number;
   residualBand: number;
   usedCategory: boolean;
+  cohortSize: number;
 } {
   const key = p.category ?? 'Unclassified';
+  const usedCategory = hasCohort(p, fit, constants);
   const count = fit.categoryCount.get(key) ?? 0;
-  const usedCategory = count >= constants.min_peers;
-  const logMultiple = predictLogRatio(p, fit);
+  const logMultiple = predictLogRatio(p, fit, usedCategory);
   const multiple = Math.exp(logMultiple);
   const implied = Math.max(1, Math.round(p.tvl_usd * multiple));
-  // The band is this category's own residual spread, widened for thin categories by shrinkage.
-  const half = usedCategory ? (fit.categoryBand.get(key) ?? (fit.highResidual - fit.lowResidual) / 2) : (fit.highResidual - fit.lowResidual) / 2;
-  const band = half;
-  const lowBand = -half;
-  const highBand = half;
+  const band = bandFor(p, fit, constants);
   return {
     implied,
-    low: Math.max(1, Math.round(p.tvl_usd * Math.exp(logMultiple + lowBand))),
-    high: Math.max(2, Math.round(p.tvl_usd * Math.exp(logMultiple + highBand))),
+    low: Math.max(1, Math.round(p.tvl_usd * Math.exp(logMultiple + band.low))),
+    high: Math.max(2, Math.round(p.tvl_usd * Math.exp(logMultiple + band.high))),
     multiple,
     peerCount: usedCategory ? count : fit.peers.length,
-    peerBasis: usedCategory ? key : 'all token peers',
+    peerBasis: usedCategory ? key : 'all token peers, no cohort',
     logMultiple,
-    residualBand: band,
+    residualBand: (band.high - band.low) / 2,
     usedCategory,
+    cohortSize: count,
   };
 }
 
@@ -688,20 +748,21 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): { steps: str
   };
 }
 
-/** The board: every watchlist slug, then the early pre-token protocols below the floor. */
+/**
+ * The board: every pre-token protocol the snapshot ranks, above and below the floor, then any
+ * watchlist slug that the rankable rule drops (a wrapped, staked or versioned product) so the
+ * watchlist is covered, flagged rather than silently ranked as a launch.
+ */
 export function buildBoard(snapshot: Snapshot, constants: ModelConstants = MODEL): BoardRow[] {
   const fit = fitPeers(snapshot, constants);
   const index = new Map(snapshot.protocols.map((p) => [p.slug, p]));
   const chosen = new Map<string, SnapshotProtocol>();
+  for (const p of snapshot.protocols) if (isRankable(p)) chosen.set(p.slug, p);
   for (const slug of snapshot.watchlist) {
     const p = index.get(slug);
-    if (p !== undefined) chosen.set(slug, p);
+    if (p !== undefined && !chosen.has(slug)) chosen.set(slug, p);
   }
-  const early = snapshot.protocols
-    .filter((p) => !chosen.has(p.slug) && isRankable(p) && p.tvl_usd < snapshot.floor_usd)
-    .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0))
-    .slice(0, EARLY_ROWS);
-  for (const p of early) chosen.set(p.slug, p);
+  for (const p of [...chosen.values()]) if (chosen.size > EARLY_ROWS && p.tvl_usd < snapshot.floor_usd && !snapshot.watchlist.includes(p.slug)) chosen.delete(p.slug);
 
   const scored = [...chosen.values()].map((p) => {
     const e = estimate(p, fit, constants);
@@ -724,16 +785,19 @@ export function buildBoard(snapshot: Snapshot, constants: ModelConstants = MODEL
       symbol: null,
       token_status: 'pre-token',
       age_days: s.age,
+      product_of_another: !isRankable(s.p),
       implied_value_usd: s.e.implied,
       implied_range_usd: { low: s.e.low, high: s.e.high },
       route: routeOf(s.p),
-      confidence: s.e.peerCount >= constants.min_peers && s.e.residualBand <= 0.8 ? 'Moderate' : 'Low',
+      // The band is wide by construction on this snapshot, and a low confidence is the honest label.
+      confidence: 'Low',
       model: {
         multiple: Math.round(s.e.multiple * 1e4) / 1e4,
         peer_count: s.e.peerCount,
         peer_category: s.e.peerBasis,
         log_multiple: Math.round(s.e.logMultiple * 1e4) / 1e4,
         residual_band: Math.round(s.e.residualBand * 1e4) / 1e4,
+        cohort_size: s.e.cohortSize,
       },
       farm_steps: plan.steps,
     };
@@ -749,14 +813,13 @@ export function buildRadar(snapshot: Snapshot, constants: ModelConstants = MODEL
   let product = 0;
   let release = 0;
   let other = 0;
+  const onBoard = new Set(board.map((r) => r.slug));
   for (const p of snapshot.protocols) {
+    if (onBoard.has(p.slug)) continue; // it is a row, counted by rows.length
     if (!isPreToken(p)) token++;
     else if (isProductOfAnother(p)) product++;
     else if (VERSIONED.test(p.name)) release++;
-    else if (p.tvl_usd < snapshot.floor_usd && !watchlist.has(p.slug)) {
-      // A rankable protocol below the floor that the early cut did not reach.
-      if (!board.some((r) => r.slug === p.slug)) other++;
-    }
+    else other++;
   }
   const rows: RadarRow[] = board.map((row) => {
     const p = snapshot.protocols.find((q) => q.slug === row.slug) as SnapshotProtocol;
@@ -773,6 +836,7 @@ export function buildRadar(snapshot: Snapshot, constants: ModelConstants = MODEL
       listed_at: row.listed_at,
       age_days: row.age_days,
       watchlist: watchlist.has(row.slug),
+      product_of_another: row.product_of_another,
       route: row.route,
       access: accessNote(p),
       implied_value_usd: row.implied_value_usd,
@@ -784,8 +848,12 @@ export function buildRadar(snapshot: Snapshot, constants: ModelConstants = MODEL
       confidence: row.confidence,
       evidence: [
         `TVL $${row.tvl_usd.toLocaleString('en-US')} across ${row.chains.length} chain${row.chains.length === 1 ? '' : 's'}${row.chains.length > 3 ? ` (${row.chains.slice(0, 3).join(', ')} +${row.chains.length - 3} more)` : row.chains.length ? ` (${row.chains.join(', ')})` : ''}`,
-        `No token recorded on ${snapshot.as_of}`,
-        `${row.model.peer_count} peers in ${row.model.peer_category} set the multiple`,
+        row.product_of_another
+          ? 'On the watchlist, but the snapshot marks this as a product of another asset or a versioned release: kept for coverage, not counted as a launch'
+          : `No token recorded on ${snapshot.as_of}`,
+        row.model.peer_category === 'all token peers, no cohort'
+          ? `${row.model.cohort_size} peer${row.model.cohort_size === 1 ? '' : 's'} in this category is under the ${constants.min_peers} the model needs, so ${row.model.peer_count} token peers price it by TVL alone and its range is widened`
+          : `${row.model.peer_count} peers in ${row.model.peer_category} set the multiple`,
         `Range $${row.implied_range_usd.low.toLocaleString('en-US')} to $${row.implied_range_usd.high.toLocaleString('en-US')} at the model’s measured residual band`,
       ],
       farm_steps: plan.steps,
@@ -807,9 +875,10 @@ export function buildRadar(snapshot: Snapshot, constants: ModelConstants = MODEL
       formula: `log(mcap / TVL) = ${fit.intercept.toFixed(3)} + (${fit.weights.tvl.toFixed(3)}) × log10(TVL) + shrunk category effect`,
       notes: [
         `${fit.calibration.peer_count} protocols that already record a token train the model; a protocol's own market cap never enters its own estimate.`,
-        `Five-fold cross-validation over those peers holds out every cap once: log MAE ${fit.calibration.log_mae.toFixed(3)} against ${fit.calibration.baseline_log_mae.toFixed(3)} for one global multiple.`,
-        `The band uses training-residual ten-to-ninetieth percentiles and covers ${(fit.calibration.interval_coverage * 100).toFixed(0)}% of the held-out peers.`,
+        `Five-fold cross-validation over those peers holds out every cap once: log MAE ${fit.calibration.log_mae.toFixed(3)} against ${fit.calibration.baseline_log_mae.toFixed(3)} for one global median multiple, refitted on each fold's training peers.`,
+        `The band is the fitted ten-to-ninetieth residual band, widened by the standard error of a thin category's median, and covers ${(fit.calibration.interval_coverage * 100).toFixed(0)}% of the held-out peers; the same function draws every row's range.`,
         `Growth and tracking age were each added to this fit and measured the same way: ${fit.calibration.ablation.filter((x) => x.feature !== 'tvl').map((x) => `${x.feature} moves held-out error by ${x.delta >= 0 ? '+' : ''}${x.delta.toFixed(3)}`).join(', ')} log units, under the ${fit.calibration.material_delta} the model treats as material, so neither is retained and neither can move a score.`,
+        `A category needs ${constants.min_peers} peers of its own before its effect is used: below that a row is priced by TVL alone, says so, and gets a wider range for the missing cohort.`,
         `Conditional value only: not a launch forecast, not a payout, not investment advice, and no protocol's name changes its score.`,
       ],
     },

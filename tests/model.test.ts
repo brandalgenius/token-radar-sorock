@@ -1,8 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { buildRadar, parseSnapshot, isPreToken, isRankable, fitPeers, estimate, accessNote, farmSteps } from '../lib/model.ts';
-const snapshot = parseSnapshot(readFileSync('/home/ubuntu/.hermes/cache/scratch/makefun-token-radar/kit/token-radar-01-kit/input/snapshot.json', 'utf8'));
+// The kit's sealed snapshot, never committed: point SIGNAL_SNAPSHOT at it, or put it in input/.
+const SNAPSHOT = process.env.SIGNAL_SNAPSHOT ?? 'input/snapshot.json';
+if (!existsSync(SNAPSHOT)) throw new Error(`no snapshot at ${SNAPSHOT}: set SIGNAL_SNAPSHOT or copy the kit's input/snapshot.json there`);
+const snapshot = parseSnapshot(readFileSync(SNAPSHOT, 'utf8'));
 const example = { ...snapshot.protocols.find(p=>p.slug==='curvance')! };
 
 test('missing token identity is not proof of a usable public deposit product', () => {
