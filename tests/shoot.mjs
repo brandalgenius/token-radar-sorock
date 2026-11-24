@@ -1,4 +1,4 @@
-import { chromium } from '/home/ubuntu/.hermes/cache/scratch/makefun-token-radar/browser-tools/node_modules/playwright/index.mjs';
+import { chromium } from 'playwright';
 import { mkdirSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 

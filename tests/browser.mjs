@@ -2,7 +2,8 @@
 import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
+import { chromium } from 'playwright';
+// Install Playwright locally for this optional QA; production has no dependencies.
 const browser = await chromium.launch();
 const page = await browser.newPage({viewport:{width:1440,height:1000}});
 const errors = [], network = [];
