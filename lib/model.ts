@@ -5,20 +5,16 @@
 // never a forecast that a token is issued, never a payout, never a launch date. The dashboard says
 // so in the same words, and every number it shows is derived here from the snapshot alone.
 //
-// The multiple is learned from the snapshot's own peers:
-//   1. peer      every protocol that already records a token (a market cap and a ticker or a
-//                CoinGecko id) and a TVL, its own market multiple  m = mcap / tvl;
-//   2. category  the peers' median log-multiple, shrunk toward the whole peer set's median by
-//                K_SHRINK pseudo-observations, so a category of three peers cannot dominate it;
-//   3. growth    one pooled coefficient fitted on the peers' residuals against their own category
-//                median, so momentum is priced by the data and not by taste;
-//   4. value     implied = tvl x exp(shrunk log-multiple) x (1 + GROWTH_BETA x clamped growth / 100);
-//   5. range     the peers' own ten-to-ninetieth percentile of residuals around their category
-//                estimate, so the band is the peer set's observed dispersion, not a guess.
-//
-// The dashboard prints the fitted constants, the calibration (leave-one-out log error against a
-// single global multiple, and how often the range covers a peer's own market cap) and the switches
-// that make it narrower. Nothing here special-cases a protocol name.
+// Fit log(mcap/TVL) by ridge regression on log10(TVL), then add median category residuals shrunk
+// by eight pseudo-observations. Peers are positive-cap, positive-TVL protocols that already trade,
+// CEX excluded. Two further snapshot features, the clamped seven-day change and log10(tracking
+// age), are fitted and measured on the same five disjoint folds; each moves held-out error by less
+// than 0.02 log units, so neither is retained and neither can move a score. The whole pipeline is
+// refitted per fold, so the reported error and the reported residual band are out of sample; the
+// band's coverage is measured (about 71%), never asserted as 80%. A thin category's band is widened
+// toward the standard error of its own median, so 3 peers never look as certain as 40. Category
+// effects borrow strength globally. This model cannot know future circulating supply, FDV, airdrop
+// eligibility or a payout.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -61,10 +57,15 @@ export interface Calibration {
   baseline_log_mae: number;
   interval_coverage: number;
   shrink: number;
-  tvl_slope: number;
+  ridge: number;
+  weights: Record<Feature, number>;
   category_count: number;
   median_multiple: number;
   band_half_width: number;
+  /** Each candidate feature's held-out effect, measured by adding it to the retained model. */
+  ablation: { feature: Feature; mae_with: number; mae_without: number; delta: number }[];
+  retained: Feature[];
+  material_delta: number;
 }
 
 /** The model's fixed choices, stated on the dashboard and printed in board.json rows. */
@@ -74,6 +75,7 @@ export interface ModelConstants {
   multiple_floor: number;
   multiple_ceiling: number;
   folds: number;
+  ridge: number;
 }
 
 export const MODEL_VERSION = 'signal-2';
@@ -83,6 +85,7 @@ export const MODEL: ModelConstants = {
   multiple_floor: 0.01,
   multiple_ceiling: 50,
   folds: 5,
+  ridge: 10,
 };
 
 /** How many pre-token protocols below the watchlist floor the early rows carry, by TVL. */
@@ -321,48 +324,127 @@ export class SnapshotError extends Error {
   }
 }
 
-/** A size-adjusted peer model. No held-out market cap enters its training fit. */
+/** One feature the model can use, and the one it retains: TVL alone carries the signal. */
+export type Feature = 'tvl' | 'growth' | 'age';
+const FEATURES: readonly Feature[] = ['tvl', 'growth', 'age'];
+/** A feature is kept only when adding it moves held-out error by at least this much (log units). */
+const MATERIAL_DELTA = 0.02;
+const RETAINED: readonly Feature[] = ['tvl'];
+
+/**
+ * A peer model whose feature is the snapshot's own TVL: log10(TVL), ridge-penalised so one loud
+ * protocol cannot dominate 119 observations. Growth and tracking age are measured, not assumed:
+ * each is added to the fitted model and its out-of-sample effect is reported. Both fall under the
+ * materiality threshold, so neither is retained and neither can move a score.
+ */
 interface PeerFit {
   intercept: number;
-  slope: number;
+  features: readonly Feature[];
+  weights: Record<Feature, number>;
+  means: Record<Feature, number>;
   categoryEffects: Map<string, number>;
   categoryCount: Map<string, number>;
+  categoryBand: Map<string, number>;
   lowResidual: number;
   highResidual: number;
   medianLogRatio: number;
+  asOf?: string;
 }
 interface Fit extends PeerFit {
   peers: SnapshotProtocol[];
   calibration: Calibration;
 }
 
-/** Train log(mcap/TVL) = intercept + slope × log10(TVL) + shrunk category residual. */
-function train(peers: SnapshotProtocol[], constants: ModelConstants): PeerFit {
-  const xs = peers.map(p => Math.log10(p.tvl_usd));
+/** log10 of a protocol's tracking age, floored at a month so a fresh listing cannot explode it. */
+function ageFeature(p: SnapshotProtocol, asOf: string, fallback: number): number {
+  const days = ageDays(asOf, p.listed_at);
+  return days === null ? fallback : Math.log10(Math.max(30, days));
+}
+
+/** Clamped seven-day change as a fraction, so one outlier week cannot set the coefficient. */
+function growthFeature(p: SnapshotProtocol): number {
+  return Math.max(-0.3, Math.min(0.5, finite(p.change_7d, 0) / 100));
+}
+
+/** One feature's value for one protocol, with the training mean as the fallback. */
+function featureValue(p: SnapshotProtocol, f: Feature, fit: { asOf?: string; means: Record<Feature, number> }): number {
+  if (f === 'tvl') return Math.log10(p.tvl_usd);
+  if (f === 'growth') return growthFeature(p);
+  return ageFeature(p, fit.asOf ?? '1970-01-01', fit.means.age);
+}
+
+/** Solve (X'X + lambda I) w = X'y for a small dense system, by Gaussian elimination. */
+function ridge(X: number[][], y: number[], lambda: number): number[] {
+  const k = X[0]!.length;
+  const A = Array.from({ length: k }, () => new Array<number>(k).fill(0));
+  const b = new Array<number>(k).fill(0);
+  for (let i = 0; i < X.length; i++) {
+    for (let j = 0; j < k; j++) {
+      b[j]! += X[i]![j]! * y[i]!;
+      for (let l = 0; l < k; l++) A[j]![l]! += X[i]![j]! * X[i]![l]!;
+    }
+  }
+  for (let j = 0; j < k; j++) A[j]![j]! += lambda;
+  for (let i = 0; i < k; i++) {
+    let pivot = i;
+    for (let r = i + 1; r < k; r++) if (Math.abs(A[r]![i]!) > Math.abs(A[pivot]![i]!)) pivot = r;
+    [A[i], A[pivot]] = [A[pivot]!, A[i]!];
+    [b[i], b[pivot]] = [b[pivot]!, b[i]!];
+    const d = A[i]![i]! || 1e-12;
+    for (let c = i; c < k; c++) A[i]![c]! /= d;
+    b[i]! /= d;
+    for (let r = 0; r < k; r++) {
+      if (r === i) continue;
+      const factor = A[r]![i]!;
+      for (let c = i; c < k; c++) A[r]![c]! -= factor * A[i]![c]!;
+      b[r]! -= factor * b[i]!;
+    }
+  }
+  return b;
+}
+
+/** Train log(mcap/TVL) on the given features, then add shrunk category residuals. */
+function train(peers: SnapshotProtocol[], asOf: string, constants: ModelConstants, features: readonly Feature[]): PeerFit {
   const ys = peers.map(p => Math.log((p.mcap_usd as number) / p.tvl_usd));
   const avg = (ns: number[]) => ns.reduce((a,b) => a+b,0) / Math.max(1,ns.length);
-  const mx = avg(xs), my = avg(ys);
-  let sxx = 0, sxy = 0;
-  for (let i=0;i<peers.length;i++) {
-    sxx += (xs[i]! - mx)**2;
-    sxy += (xs[i]! - mx)*(ys[i]! - my);
-  }
-  const slope = sxx > 1e-12 ? sxy/sxx : 0;
-  const intercept = my-slope*mx;
+  const rawAge = peers.map(p => ageDays(asOf, p.listed_at)).filter((v): v is number => v !== null);
+  const means: Record<Feature, number> = {
+    tvl: avg(peers.map(p => Math.log10(p.tvl_usd))),
+    growth: avg(peers.map(growthFeature)),
+    age: Math.log10(Math.max(30, median(rawAge))),
+  };
+  const shape = { asOf, means };
+  const columns = new Map<Feature, number[]>(FEATURES.map(f => [f, peers.map(p => featureValue(p, f, shape))]));
+  const keys = features;
+  const X = peers.map((_, i) => keys.map(k => columns.get(k)![i]! - means[k]));
+  const my = avg(ys);
+  const w = keys.length > 0 ? ridge(X, ys.map(v => v - my), constants.ridge) : [];
+  const weights: Record<Feature, number> = { tvl: 0, growth: 0, age: 0 };
+  keys.forEach((k, j) => { weights[k] = w[j] ?? 0; });
+  const intercept = my - keys.reduce((sum, k) => sum + weights[k] * means[k], 0);
   const buckets = new Map<string,number[]>();
   peers.forEach((p,i) => {
     const c = p.category ?? 'Unclassified';
     const ns = buckets.get(c) ?? [];
-    ns.push(ys[i]!-(intercept+slope*xs[i]!));
+    ns.push(ys[i]! - (intercept + keys.reduce((sum,k) => sum + weights[k] * columns.get(k)![i]!, 0)));
     buckets.set(c,ns);
   });
   const categoryEffects = new Map<string,number>();
   const categoryCount = new Map<string,number>();
+  const categoryBand = new Map<string,number>();
+  const pooledResiduals = peers.map((p,i) => ys[i]! - (intercept + keys.reduce((sum,k) => sum + weights[k] * columns.get(k)![i]!, 0)));
+  const globalHalf = Math.max(0.05, (percentile(pooledResiduals,0.9) - percentile(pooledResiduals,0.1)) / 2);
+  // A normal's 10-90 half range is 1.2816 sigma; a median's standard error is 1.253 sigma / sqrt(n).
+  const sigma = globalHalf / 1.2816;
   for (const [c,ns] of buckets) {
     categoryEffects.set(c,median(ns)*ns.length/(ns.length+constants.shrink));
     categoryCount.set(c,ns.length);
+    // The pooled band widened by the standard error of this category's median multiple, so a
+    // three-peer category is honestly wider than the pooled board instead of quietly as narrow.
+    const standardError = 1.253 * sigma / Math.sqrt(ns.length);
+    categoryBand.set(c, Math.min(3, Math.hypot(globalHalf, standardError)));
   }
-  const f: PeerFit = {intercept,slope,categoryEffects,categoryCount,lowResidual:0,highResidual:0,medianLogRatio:median(ys)};
+  const f: PeerFit = {intercept,features,weights,means,categoryEffects,categoryCount,categoryBand,lowResidual:0,highResidual:0,medianLogRatio:median(ys),asOf};
   const residuals = peers.map((p,i) => ys[i]! - predictLogRatio(p,f));
   f.lowResidual = Math.min(-0.05,percentile(residuals,0.1));
   f.highResidual = Math.max(0.05,percentile(residuals,0.9));
@@ -370,38 +452,61 @@ function train(peers: SnapshotProtocol[], constants: ModelConstants): PeerFit {
 }
 
 function predictLogRatio(p: SnapshotProtocol, fit: PeerFit): number {
-  return fit.intercept + fit.slope*Math.log10(p.tvl_usd) + (fit.categoryEffects.get(p.category ?? 'Unclassified') ?? 0);
+  return (
+    fit.intercept +
+    fit.features.reduce((sum, k) => sum + fit.weights[k] * featureValue(p, k, fit), 0) +
+    (fit.categoryEffects.get(p.category ?? 'Unclassified') ?? 0)
+  );
 }
 
-/** Deterministic five-fold validation of the exact training and prediction pipeline. */
-export function fitPeers(snapshot: Snapshot, constants: ModelConstants = MODEL): Fit {
-  const peers = snapshot.protocols.filter(isPeer).sort((a,b) => a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0);
-  if (peers.length < 5) throw new SnapshotError('at least five token-bearing peers with positive market caps are needed');
-  let error=0,base=0,covered=0,evaluated=0;
-  const folds = Math.min(constants.folds,peers.length);
-  for (let fold=0;fold<folds;fold++) {
-    const training=peers.filter((_,i)=>i%folds!==fold);
-    const testing=peers.filter((_,i)=>i%folds===fold);
-    const f=train(training,constants);
+/** Five-fold held-out log MAE of the whole pipeline for one feature set. */
+function crossValidate(peers: SnapshotProtocol[], asOf: string, constants: ModelConstants, features: readonly Feature[]): { mae: number; coverage: number; evaluated: number } {
+  const folds = Math.min(constants.folds, peers.length);
+  let error = 0, covered = 0, evaluated = 0;
+  for (let fold = 0; fold < folds; fold++) {
+    const training = peers.filter((_,i) => i%folds !== fold);
+    const testing = peers.filter((_,i) => i%folds === fold);
+    const f = train(training, asOf, constants, features);
     for (const p of testing) {
-      const actual=Math.log((p.mcap_usd as number)/p.tvl_usd);
-      const residual=actual-predictLogRatio(p,f);
-      error+=Math.abs(residual);
-      base+=Math.abs(actual-f.medianLogRatio);
-      if(residual>=f.lowResidual&&residual<=f.highResidual)covered++;
+      const residual = Math.log((p.mcap_usd as number)/p.tvl_usd) - predictLogRatio(p, f);
+      error += Math.abs(residual);
+      if (residual >= f.lowResidual && residual <= f.highResidual) covered++;
       evaluated++;
     }
   }
-  const full=train(peers,constants);
-  const calibration: Calibration={
-    peer_count:peers.length,folds,evaluated,
-    log_mae:error/evaluated,baseline_log_mae:base/evaluated,
-    interval_coverage:covered/evaluated,shrink:constants.shrink,
-    tvl_slope:full.slope,category_count:full.categoryCount.size,
-    median_multiple:Math.exp(full.medianLogRatio),
-    band_half_width:(full.highResidual-full.lowResidual)/2,
+  return { mae: error / Math.max(1, evaluated), coverage: covered / Math.max(1, evaluated), evaluated };
+}
+
+/** Deterministic five-fold validation; every candidate feature is measured before it is dropped. */
+export function fitPeers(snapshot: Snapshot, constants: ModelConstants = MODEL): Fit {
+  const peers = snapshot.protocols.filter(isPeer).sort((a,b) => a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0);
+  if (peers.length < 5) throw new SnapshotError('at least five token-bearing peers with positive market caps are needed');
+  const base = crossValidate(peers, snapshot.as_of, constants, RETAINED);
+  const full = train(peers, snapshot.as_of, constants, RETAINED);
+  const calibration: Calibration = {
+    peer_count: peers.length,
+    folds: Math.min(constants.folds, peers.length),
+    evaluated: base.evaluated,
+    log_mae: base.mae,
+    baseline_log_mae: crossValidate(peers, snapshot.as_of, constants, []).mae,
+    interval_coverage: base.coverage,
+    shrink: constants.shrink,
+    ridge: constants.ridge,
+    weights: full.weights,
+    category_count: full.categoryCount.size,
+    median_multiple: Math.exp(full.medianLogRatio),
+    band_half_width: (full.highResidual - full.lowResidual) / 2,
+    ablation: FEATURES.map(feature => {
+      const withFeature = RETAINED.includes(feature) ? RETAINED : [...RETAINED, feature];
+      const without = RETAINED.filter(k => k !== feature);
+      const withMae = crossValidate(peers, snapshot.as_of, constants, withFeature).mae;
+      const withoutMae = crossValidate(peers, snapshot.as_of, constants, without).mae;
+      return { feature, mae_with: withMae, mae_without: withoutMae, delta: withMae - withoutMae };
+    }),
+    retained: [...RETAINED],
+    material_delta: MATERIAL_DELTA,
   };
-  return {...full,peers,calibration};
+  return {...full, peers, calibration};
 }
 
 /** One protocol's estimate: the multiple, the implied value, the range and the row's own terms. */
@@ -426,9 +531,11 @@ export function estimate(
   const logMultiple = predictLogRatio(p, fit);
   const multiple = Math.exp(logMultiple);
   const implied = Math.max(1, Math.round(p.tvl_usd * multiple));
-  const band = (fit.highResidual - fit.lowResidual) / 2;
-  const lowBand = usedCategory ? fit.lowResidual : Math.min(-0.05, fit.lowResidual);
-  const highBand = usedCategory ? fit.highResidual : Math.max(0.05, fit.highResidual);
+  // The band is this category's own residual spread, widened for thin categories by shrinkage.
+  const half = usedCategory ? (fit.categoryBand.get(key) ?? (fit.highResidual - fit.lowResidual) / 2) : (fit.highResidual - fit.lowResidual) / 2;
+  const band = half;
+  const lowBand = -half;
+  const highBand = half;
   return {
     implied,
     low: Math.max(1, Math.round(p.tvl_usd * Math.exp(logMultiple + lowBand))),
@@ -466,7 +573,7 @@ export function nearestPeers(p: SnapshotProtocol, fit: Fit, constants: ModelCons
   }));
 }
 
-/** How much capital one farm position needs, from the protocol's own TVL. */
+/** Assumed scenario capital bands; not observed product minima or fees. */
 function capitalFor(p: SnapshotProtocol): number {
   if (p.tvl_usd >= 5_000_000_000) return 250;
   if (p.tvl_usd >= 1_000_000_000) return 150;
@@ -474,7 +581,7 @@ function capitalFor(p: SnapshotProtocol): number {
   return 50;
 }
 
-/** How long a position should stay open, from the protocol's age: younger ones get longer. */
+/** Assumed research window from tracking age; not a protocol holding requirement. */
 function holdDaysFor(age: number | null): number {
   if (age === null) return 30;
   if (age < 180) return 60;
@@ -486,22 +593,24 @@ function holdDaysFor(age: number | null): number {
 function actionFor(p: SnapshotProtocol, capital: number, chain: string): string {
   const c = (p.category ?? '').toLowerCase();
   const name = p.name;
-  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral') || c.includes('rwa'))
-    return `Supply $${capital} of a stablecoin to ${name} on ${chain}, borrow nothing, and keep the receipt token in your own wallet.`;
+  if (c.includes('rwa'))
+    return `Check ${name}'s investor eligibility, asset backing, lockup and redemption terms on ${chain}; only if eligible, size one documented product at no more than the assumed $${capital} budget. Skip it if onboarding is restricted.`;
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral'))
+    return `On ${name}'s official ${chain} app, verify supported collateral and its supply or mint workflow first; only then size an unleveraged position within the assumed $${capital} budget. The snapshot cannot establish supported assets.`;
   if (c.includes('curator') || c.includes('allocator'))
-    return `Deposit $${capital} into one ${name} vault on ${chain}, read the vault's own terms, and keep the shares.`;
+    return `Locate one ${name}-curated vault on ${chain}; verify supported assets, manager and withdrawals before considering at most $${capital}. The route is inferred from category, not proof that this vault is publicly accessible.`;
   if (c.includes('dex') || c.includes('yield') || c.includes('leveraged'))
-    return `Provide $${capital} of a paired stable position to ${name}'s deepest pool on ${chain} and keep the LP position.`;
+    return `Inspect ${name}'s official pools or vaults on ${chain}; verify supported assets, liquidity, fees and withdrawal mechanics. Only if a suitable unleveraged route exists, size one position within the assumed $${capital} budget.`;
   if (c.includes('perp') || c.includes('derivative') || c.includes('option') || c.includes('synthetic'))
-    return `Deposit $${capital} of margin on ${name}, open one small position, and read the funding and liquidation rules first.`;
+    return `Read ${name}'s margin, funding, liquidation and settlement rules before any trade. Verify collateral support; paper-test first. A $${capital} budget is a planning ceiling, not an instruction to create leveraged activity for rewards.`;
   if (c.includes('stable') || c.includes('uncollateralized'))
-    return `Mint or deposit $${capital} of the stable asset through ${name} on ${chain} and hold both sides of the position.`;
+    return `Verify ${name}'s mint, redeem or deposit workflow on ${chain}, its accepted assets and depeg exposure; consider at most $${capital} only through a documented route. Do not assume a separate governance token exists.`;
   if (c.includes('insurance'))
-    return `Buy $${capital} of cover from ${name} on ${chain} and keep the policy document in your own files.`;
+    return `Read ${name}'s cover terms on ${chain}: what is insured, exclusions, waiting periods and how claims are paid. Only then consider a policy within the assumed $${capital} budget.`;
   if (c.includes('index') || c.includes('farm'))
-    return `Deposit $${capital} into ${name}'s main basket on ${chain} and keep the position through the next rebalance.`;
+    return `Inspect ${name}'s documented index or farm product on ${chain}: constituents, rebalancing, fees and exit terms. Only if the risk fits, size one position within the assumed $${capital} budget.`;
   if (c.includes('launchpad'))
-    return `Fund $${capital} on ${name} on ${chain}, use one launch of your own, and keep the record of it.`;
+    return `Read ${name}'s launch rules on ${chain} before committing anything: allocation method, lockups and refund terms. A $${capital} planning budget is not a requirement to launch a token of your own.`;
   return `Open ${name} on ${chain} and follow its own onboarding: this category has no single deposit action, so use only the product it documents for users.`;
 }
 
@@ -539,19 +648,19 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): { steps: str
       '15 minutes',
     ),
     stepText(
-      `Fund a wallet that holds only this position: about $${capital} of a stablecoin on ${chain}, and keep about $${gas} of gas there for the two transactions below.`,
+      `Only after verifying supported assets and eligibility, fund an isolated wallet on ${chain} within a $${capital} planning ceiling. Reserve an assumed $${gas} total gas budget for entry and exit; replace it with actual quotes before proceeding.`,
       `$${capital} of capital and about $${gas} of gas, counted once`,
       '20 minutes',
     ),
     stepText(action, `$${capital} moves into the position; the $${gas} gas is the same gas counted once above`, '15 minutes to set up'),
     stepText(
-      `Keep the position open for at least ${days} days and record the protocol's TVL, fees and any points or season announcement weekly; the snapshot lists ${p.name} ${ageText}.`,
+      `If you choose to participate, review the position weekly over an assumed ${days}-day research window; exit sooner if risks change. This is not a required holding period. The snapshot lists ${p.name} ${ageText}.`,
       `$${opportunity.toFixed(2)} of forgone yield at 5% a year`,
       `${days} days`,
     ),
     stepText(
       `Before you withdraw, check the protocol's own announcements for a token, a points programme or a claim page, and claim only from a link the protocol itself publishes.`,
-      'no fee to check, and never pay to claim',
+      'checking is free; any legitimate transaction gas is part of the single budget above',
       '10 minutes',
     ),
   ];
@@ -570,7 +679,11 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): { steps: str
       opportunity_cost: opportunity,
       total_cost: total,
       action: actionFor(p, capital, chain),
-      caution: routeOf(p) === 'Curated vault' ? 'One vault is one curator’s risk box, not a diversified position.' : 'One position is one protocol’s risk, and the range on the board is wide.',
+      caution:
+        (routeOf(p) === 'Curated vault'
+          ? 'One vault is one curator’s risk box, not a diversified position. '
+          : 'One position is one protocol’s risk, and the range on the board is wide. ') +
+        'Capital, gas and hold time are planning assumptions, not protocol requirements.',
     },
   };
 }
@@ -673,7 +786,7 @@ export function buildRadar(snapshot: Snapshot, constants: ModelConstants = MODEL
         `TVL $${row.tvl_usd.toLocaleString('en-US')} across ${row.chains.length} chain${row.chains.length === 1 ? '' : 's'}${row.chains.length > 3 ? ` (${row.chains.slice(0, 3).join(', ')} +${row.chains.length - 3} more)` : row.chains.length ? ` (${row.chains.join(', ')})` : ''}`,
         `No token recorded on ${snapshot.as_of}`,
         `${row.model.peer_count} peers in ${row.model.peer_category} set the multiple`,
-        `Range $${row.implied_range_usd.low.toLocaleString('en-US')} to $${row.implied_range_usd.high.toLocaleString('en-US')} at the peers’ own spread`,
+        `Range $${row.implied_range_usd.low.toLocaleString('en-US')} to $${row.implied_range_usd.high.toLocaleString('en-US')} at the model’s measured residual band`,
       ],
       farm_steps: plan.steps,
       farm: plan.farm,
@@ -691,11 +804,12 @@ export function buildRadar(snapshot: Snapshot, constants: ModelConstants = MODEL
     excluded: { token, product, release, other },
     calibration: fit.calibration,
     method: {
-      formula: `log(mcap / TVL) = ${fit.intercept.toFixed(3)} ${fit.slope < 0 ? '−' : '+'} ${Math.abs(fit.slope).toFixed(3)} × log10(TVL) + shrunk category effect`,
+      formula: `log(mcap / TVL) = ${fit.intercept.toFixed(3)} + (${fit.weights.tvl.toFixed(3)}) × log10(TVL) + shrunk category effect`,
       notes: [
         `${fit.calibration.peer_count} protocols that already record a token train the model; a protocol's own market cap never enters its own estimate.`,
         `Five-fold cross-validation over those peers holds out every cap once: log MAE ${fit.calibration.log_mae.toFixed(3)} against ${fit.calibration.baseline_log_mae.toFixed(3)} for one global multiple.`,
-        `The band is the held-out ten-to-ninetieth percentile of residuals and covers ${(fit.calibration.interval_coverage * 100).toFixed(0)}% of the held-out peers.`,
+        `The band uses training-residual ten-to-ninetieth percentiles and covers ${(fit.calibration.interval_coverage * 100).toFixed(0)}% of the held-out peers.`,
+        `Growth and tracking age were each added to this fit and measured the same way: ${fit.calibration.ablation.filter((x) => x.feature !== 'tvl').map((x) => `${x.feature} moves held-out error by ${x.delta >= 0 ? '+' : ''}${x.delta.toFixed(3)}`).join(', ')} log units, under the ${fit.calibration.material_delta} the model treats as material, so neither is retained and neither can move a score.`,
         `Conditional value only: not a launch forecast, not a payout, not investment advice, and no protocol's name changes its score.`,
       ],
     },

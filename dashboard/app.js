@@ -143,14 +143,14 @@
     });
     results.replaceChildren();
     results.append(el('div', { class: 'resulthead' }, [
-      el('div', { html: '<h2>' + (state.view === 'early' ? 'Early radar' : state.view === 'watchlist' ? 'Watchlist' : 'Opportunity board') + '</h2><p class="hint">Ranked by conditional circulating market capitalisation. Range = peer dispersion, not a promise.</p>' }),
+      el('div', { html: '<h2>' + (state.view === 'early' ? 'Early radar' : state.view === 'watchlist' ? 'Watchlist' : 'Opportunity board') + '</h2><p class="hint">Ranked by conditional circulating market capitalisation. Range = held-out residual band, not a promise.</p>' }),
       el('span', { class: 'count', 'aria-live': 'polite', html: '<b>' + rows.length + '</b> candidates · ' + (rows.length ? state.page * PAGE + 1 : 0) + '–' + Math.min((state.page + 1) * PAGE, rows.length) }),
     ]));
 
-    var cols = [['rank', '#'], ['name', 'Protocol / route'], ['implied_value_usd', 'Conditional cap'], ['tvl_usd', 'TVL'], ['change_7d', '7d TVL'], ['peer_count', 'Evidence'], ['cost', 'Research budget']];
+    var cols = [['rank', '#'], ['name', 'Protocol / route'], ['implied_value_usd', 'Conditional cap'], ['tvl_usd', 'TVL'], ['change_7d', '7d TVL'], ['peer_count', 'Evidence'], ['cost', 'Cost / capital']];
     var head = el('tr');
     cols.forEach(function (c) {
-      var th = el('th', { scope: 'col' });
+      var th = el('th', { scope: 'col', class: ['implied_value_usd', 'tvl_usd', 'change_7d', 'peer_count', 'cost'].indexOf(c[0]) >= 0 ? 'r' : '' });
       if (['implied_value_usd', 'tvl_usd', 'change_7d', 'peer_count'].indexOf(c[0]) >= 0) {
         if (state.sort === c[0]) th.setAttribute('aria-sort', state.desc ? 'descending' : 'ascending');
         th.append(el('button', { type: 'button', text: c[1] + (state.sort === c[0] ? (state.desc ? ' ↓' : ' ↑') : ''), onclick: function () { state.desc = state.sort === c[0] ? !state.desc : true; state.sort = c[0]; renderResults(); } }));
@@ -191,9 +191,9 @@
     var c = D.calibration;
     var cards = [
       ['01 / Universe', D.universe + ' screened', D.excluded.token + ' protocols already record a token and ' + (D.excluded.token ? '' : '') + 'are separated as peers; ' + (D.excluded.product + D.excluded.release) + ' are asset products or versioned releases and never counted as launches. Parent-protocol data is absent from the snapshot, so below-floor inclusion is provisional.'],
-      ['02 / Peer engine', c.peer_count + ' token peers', 'Log(TVL) slope ' + Number(c.tvl_slope).toFixed(3) + ', category effects shrunk by ' + c.shrink + ' pseudo-observations. Full model is re-fitted in every test fold. Growth is shown, not used to inflate value.'],
+      ['02 / Peer engine', c.peer_count + ' token peers', 'Ridge ' + c.ridge + ' on log10(TVL), coefficient ' + c.weights.tvl.toFixed(3) + '. Growth and tracking age were measured and rejected: each moves held-out error by under ' + c.material_delta + ' log units. Category residuals shrink by ' + c.shrink + ' observations, and every fold re-fits the pipeline.'],
       ['03 / Held-out check', Number(c.log_mae).toFixed(2) + ' log MAE', 'Global baseline ' + Number(c.baseline_log_mae).toFixed(2) + ' over ' + c.folds + ' disjoint folds. The fitted residual band covers ' + (c.interval_coverage * 100).toFixed(0) + '% of held-out token peers. That measures the model, not a future launch.'],
-      ['04 / Reality check', 'Not a launch forecast', 'Market cap is not FDV and not your allocation. Ten snapshot fields cannot establish a token, a date, eligibility, fees or incentives. Revalidate every row before acting.'],
+      ['04 / Reality check', 'Not a launch forecast', 'Market cap is not FDV and not your allocation. Ten snapshot fields cannot establish a token, a date, eligibility, fees or incentives. Every feature is a snapshot figure; none is a promise, revalidate before acting.'],
     ];
     return el('section', { class: 'method', 'aria-label': 'Method and limitations' }, cards.map(function (k) {
       return el('div', { class: 'card', html: '<h4>' + k[0] + '</h4><div class="val2">' + k[1] + '</div><p>' + k[2] + '</p>' });
@@ -215,8 +215,8 @@
       '<h1 id="detail-title" tabindex="-1">' + esc(r.name) + '</h1>' +
       '<p class="muted">' + esc(r.category || 'Unclassified') + ' · ' + esc(r.chains.join(' · ') || 'chain unrecorded') + '</p>' +
       '<div class="detail-value"><span>' + money(r.implied_value_usd) + '</span><small>conditional launch value, not a market cap on record</small></div>' +
-      '<div class="range-label"><span>' + money(r.low_usd) + '</span><span>peer band, log scale</span><span>' + money(r.high_usd) + '</span></div>' +
-      '<div class="static-range" role="img" aria-label="Conditional value inside its peer band"><i></i><b style="left:' + Math.max(0, Math.min(100, (Math.log(r.implied_value_usd) - Math.log(r.low_usd)) / Math.max(1e-9, Math.log(r.high_usd) - Math.log(r.low_usd)) * 100)).toFixed(1) + '%"></b></div>' +
+      '<div class="range-label"><span>' + money(r.low_usd) + '</span><span>held-out residual band, log scale</span><span>' + money(r.high_usd) + '</span></div>' +
+      '<div class="static-range" role="img" aria-label="Conditional value inside its held-out residual band"><i></i><b style="left:' + Math.max(0, Math.min(100, (Math.log(r.implied_value_usd) - Math.log(r.low_usd)) / Math.max(1e-9, Math.log(r.high_usd) - Math.log(r.low_usd)) * 100)).toFixed(1) + '%"></b></div>' +
       '<div class="kv">' +
         '<div><dt>TVL at data cut</dt><dd>' + money(r.tvl_usd) + '</dd></div>' +
         '<div><dt>Peer-adjusted multiple</dt><dd>' + r.multiple.toFixed(3) + '×</dd></div>' +
