@@ -10,12 +10,12 @@
 // CEX excluded. Two further snapshot features, the clamped seven-day change and log10(tracking
 // age), are fitted and measured on the same five disjoint folds; each moves held-out error by less
 // than 0.02 log units, so neither is retained and neither can move a score. The whole pipeline is
-// refitted per fold, so the reported error and the reported residual band are out of sample; the
-// band's coverage is measured on the same function that draws each row (78% here), never asserted as 80%.
-// A thin category's band is widened
-// toward the standard error of its own median, so 3 peers never look as certain as 40. A category
-// under three peers contributes no effect at all: the row is priced by TVL alone and says so. This model cannot know future circulating supply, FDV, airdrop
-// eligibility or a payout.
+// refitted per fold, so the reported error and the reported residual band are out of sample. The band
+// is measured from production residuals, the same function that draws each row, and covers 82% of
+// held-out peers here — never asserted as 80%. A thin category's band is widened toward the standard
+// error of its own median, so 3 peers never look as certain as 40; under three peers a category
+// contributes no effect at all, and the row is priced by TVL alone and says so. This model cannot
+// know future circulating supply, FDV, airdrop eligibility or a payout.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -315,6 +315,7 @@ export interface RadarData {
   watchlist_size: number;
   board_size: number;
   early_size: number;
+  launch_size: number;
   excluded: { token: number; product: number; release: number; other: number };
   calibration: Calibration;
   method: { formula: string; notes: string[] };
@@ -462,7 +463,8 @@ function train(
     intercept, features, weights, means, categoryEffects, categoryCount,
     lowResidual: 0, highResidual: 0, sigma: 0, medianLogRatio: median(ys), asOf,
   };
-  const residuals = peers.map((p, i) => ys[i]! - predictLogRatio(p, f));
+  // The band is measured on the same estimator production prices rows with, thin-category gate included.
+  const residuals = peers.map((p, i) => ys[i]! - estimateLog(p, f, constants));
   f.lowResidual = Math.min(-0.05, percentile(residuals, 0.1));
   f.highResidual = Math.max(0.05, percentile(residuals, 0.9));
   f.sigma = Math.max(0.05, (f.highResidual - f.lowResidual) / 2) / HALF_TO_SIGMA;
@@ -874,7 +876,8 @@ export function buildRadar(snapshot: Snapshot, constants: ModelConstants = MODEL
     universe: snapshot.protocols.length,
     watchlist_size: snapshot.watchlist.length,
     board_size: board.length,
-    early_size: rows.filter((r) => !r.watchlist).length,
+    early_size: rows.filter((r) => !r.watchlist && r.tvl_usd < snapshot.floor_usd).length,
+    launch_size: rows.filter((r) => !r.product_of_another).length,
     excluded: { token, product, release, other },
     calibration: fit.calibration,
     method: {

@@ -58,9 +58,9 @@
         '<p class="lede-note">No launch dates. No invented points. No promised eligibility.</p>' }),
       el('dl', { class: 'stats', html:
         '<div class="stat"><dt>Protocols screened</dt><dd>' + D.universe + '<small>sealed universe</small></dd></div>' +
-        '<div class="stat"><dt>Launch candidates</dt><dd>' + D.rows.length + '<small>ranked, not endorsed</small></dd></div>' +
+        '<div class="stat"><dt>Launch candidates</dt><dd>' + D.launch_size + '<small>ranked, not endorsed</small></dd></div>' +
         '<div class="stat"><dt>Watchlist covered</dt><dd>' + D.watchlist_size + ' / ' + D.watchlist_size + '<small>all retained</small></dd></div>' +
-        '<div class="stat"><dt>Early discoveries</dt><dd>' + D.rows.filter(function (r) { return !r.watchlist && r.tvl_usd < D.floor_usd; }).length + '<small>below the $' + Math.round(D.floor_usd / 1e6) + 'M floor</small></dd></div>' }),
+        '<div class="stat"><dt>Early discoveries</dt><dd>' + D.early_size + '<small>below the $' + Math.round(D.floor_usd / 1e6) + 'M floor</small></dd></div>' }),
     ]);
   }
 
@@ -82,7 +82,7 @@
     });
     categories.sort(); chains.sort();
     var seg = el('div', { class: 'seg', role: 'group', 'aria-label': 'Candidate scope' });
-    [['all', 'All candidates'], ['watchlist', 'Watchlist'], ['early', 'Early radar']].forEach(function (v) {
+    [['all', 'All rows'], ['watchlist', 'Watchlist'], ['early', 'Early radar']].forEach(function (v) {
       seg.append(el('button', { type: 'button', text: v[1], 'data-view': v[0], 'aria-pressed': String(state.view === v[0]), onclick: function () { state.view = v[0]; state.page = 0; syncHash(); renderResults(); } }));
     });
     return el('section', { class: 'controls' }, [
@@ -103,7 +103,7 @@
       if (state.chain !== 'all' && r.chains.indexOf(state.chain) < 0) return false;
       if (state.route !== 'all' && r.route !== state.route) return false;
       if (state.view === 'watchlist' && !r.watchlist) return false;
-      if (state.view === 'early' && r.watchlist) return false;
+      if (state.view === 'early' && (r.watchlist || r.tvl_usd >= D.floor_usd)) return false;
       return true;
     }).sort(function (a, b) {
       var x = a[state.sort] === null || a[state.sort] === undefined ? -Infinity : a[state.sort];
@@ -143,11 +143,11 @@
     });
     results.replaceChildren();
     results.append(el('div', { class: 'resulthead' }, [
-      el('div', { html: '<h2>' + (state.view === 'early' ? 'Early radar' : state.view === 'watchlist' ? 'Watchlist' : 'Opportunity board') + '</h2><p class="hint">Ranked by conditional circulating market capitalisation. Range = held-out residual band, not a promise.</p>' }),
-      el('span', { class: 'count', 'aria-live': 'polite', html: '<b>' + rows.length + '</b> candidates · ' + (rows.length ? state.page * PAGE + 1 : 0) + '–' + Math.min((state.page + 1) * PAGE, rows.length) }),
+      el('div', { html: '<h2>' + (state.view === 'early' ? 'Early radar' : state.view === 'watchlist' ? 'Watchlist' : 'Opportunity board') + '</h2><p class="hint">' + D.launch_size + ' launch candidates + ' + (D.board_size - D.launch_size) + ' coverage-only products. Ranked by conditional circulating market capitalisation. Range = measured residual band, not a promise.</p>' }),
+      el('span', { class: 'count', 'aria-live': 'polite', html: '<b>' + rows.length + '</b> board rows · ' + (rows.length ? state.page * PAGE + 1 : 0) + '–' + Math.min((state.page + 1) * PAGE, rows.length) }),
     ]));
 
-    var cols = [['rank', '#'], ['name', 'Protocol / route'], ['implied_value_usd', 'Conditional cap'], ['tvl_usd', 'TVL'], ['change_7d', 'TVL 7d %'], ['peer_count', 'Evidence'], ['cost', 'Gas · capital']];
+    var cols = [['rank', '#'], ['name', 'Protocol / route'], ['implied_value_usd', 'Conditional cap'], ['tvl_usd', 'TVL'], ['change_7d', 'TVL 7d %'], ['peer_count', 'Evidence'], ['cost', 'Cost · capital']];
     var head = el('tr');
     cols.forEach(function (c) {
       var th = el('th', { scope: 'col', class: ['implied_value_usd', 'tvl_usd', 'change_7d', 'peer_count', 'cost'].indexOf(c[0]) >= 0 ? 'r' : '' });
@@ -211,12 +211,12 @@
     ]));
     var left = el('div', { class: 'detail-left' });
     left.append(el('section', { class: 'card', html:
-      '<div class="eyebrow">RANK ' + r.rank + ' / ' + (r.watchlist ? 'WATCHLIST' : 'EARLY DISCOVERY') + '</div>' +
+      '<div class="eyebrow">RANK ' + r.rank + ' / ' + (r.watchlist ? 'WATCHLIST' : r.tvl_usd < D.floor_usd ? 'EARLY DISCOVERY' : 'ABOVE FLOOR') + (r.product_of_another ? ' · COVERAGE ONLY, NOT A LAUNCH' : '') + '</div>' +
       '<h1 id="detail-title" tabindex="-1">' + esc(r.name) + '</h1>' +
       '<p class="muted">' + esc(r.category || 'Unclassified') + ' · ' + esc(r.chains.join(' · ') || 'chain unrecorded') + '</p>' +
-      '<div class="detail-value"><span>' + money(r.implied_value_usd) + '</span><small>conditional launch value, not a market cap on record</small></div>' +
-      '<div class="range-label"><span>' + money(r.low_usd) + '</span><span>held-out residual band, log scale</span><span>' + money(r.high_usd) + '</span></div>' +
-      '<div class="static-range" role="img" aria-label="Conditional value inside its held-out residual band"><i></i><b style="left:' + Math.max(0, Math.min(100, (Math.log(r.implied_value_usd) - Math.log(r.low_usd)) / Math.max(1e-9, Math.log(r.high_usd) - Math.log(r.low_usd)) * 100)).toFixed(1) + '%"></b></div>' +
+      '<div class="detail-value"><span>' + money(r.implied_value_usd) + '</span><small>' + (r.product_of_another ? 'coverage-only value: a product of another asset, never counted as a launch' : 'conditional launch value, not a market cap on record') + '</small></div>' +
+      '<div class="range-label"><span>' + money(r.low_usd) + '</span><span>measured residual band, log scale</span><span>' + money(r.high_usd) + '</span></div>' +
+      '<div class="static-range" role="img" aria-label="Conditional value inside its measured residual band"><i></i><b style="left:' + Math.max(0, Math.min(100, (Math.log(r.implied_value_usd) - Math.log(r.low_usd)) / Math.max(1e-9, Math.log(r.high_usd) - Math.log(r.low_usd)) * 100)).toFixed(1) + '%"></b></div>' +
       '<div class="kv">' +
         '<div><dt>TVL at data cut</dt><dd>' + money(r.tvl_usd) + '</dd></div>' +
         '<div><dt>Peer-adjusted multiple</dt><dd>' + r.multiple.toFixed(3) + '×</dd></div>' +

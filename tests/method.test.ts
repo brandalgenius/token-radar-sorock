@@ -69,6 +69,24 @@ test('held-out error and coverage use the exact production estimator, including 
   assert.equal(fit.calibration.interval_coverage, covered / evaluated);
 });
 
+test('the fitted band is the percentiles of production residuals, thin categories included', () => {
+  const sparse = { ...snapshot, protocols: peers.map((p, i) => ({ ...p, category: `Thin ${Math.floor(i / 2)}` })) };
+  const fit = fitPeers(sparse);
+  const residuals = fit.peers.map((p) => Math.log((p.mcap_usd as number) / p.tvl_usd) - estimate(p, fit).logMultiple);
+  // Independent linear interpolation, not the model's own percentile helper.
+  const sorted = [...residuals].sort((a, b) => a - b);
+  const quantile = (q: number) => {
+    const at = (sorted.length - 1) * q;
+    const lo = Math.floor(at), hi = Math.ceil(at);
+    return sorted[lo]! + (sorted[hi]! - sorted[lo]!) * (at - lo);
+  };
+  const low = Math.min(-0.05, quantile(0.1));
+  const high = Math.max(0.05, quantile(0.9));
+  assert(Math.abs(fit.lowResidual - low) < 1e-12, 'low band must be the p10 of production residuals');
+  assert(Math.abs(fit.highResidual - high) < 1e-12, 'high band must be the p90 of production residuals');
+  assert(Math.abs(fit.sigma - Math.max(0.05, (high - low) / 2) / 1.2816) < 1e-12, 'sigma must come from those same percentiles');
+});
+
 test('the reported baseline is one global median multiple, with no category effect', () => {
   const fit = fitPeers(snapshot);
   const c = fit.calibration;
@@ -85,6 +103,20 @@ test('the reported baseline is one global median multiple, with no category effe
     for (const p of test) { error += Math.abs(Math.log((p.mcap_usd as number) / p.tvl_usd) - m); n++; }
   }
   assert(Math.abs(c.baseline_log_mae - error / n) < 1e-9, `baseline ${c.baseline_log_mae} is not the plain global median ${error / n}`);
+});
+
+test('early count excludes the floor itself, above-floor rows, and watched rows', () => {
+  const candidate = (slug: string, tvl: number) => ({ ...preToken(peers[0]!), slug, name: slug, tvl_usd: tvl });
+  const protocols = [
+    ...peers,
+    candidate('below', snapshot.floor_usd - 1),
+    candidate('at', snapshot.floor_usd),
+    candidate('above', snapshot.floor_usd + 1),
+    candidate('watched', snapshot.floor_usd - 2),
+  ];
+  const { radar } = buildRadar({ ...snapshot, protocols, watchlist: ['watched'] });
+  assert.equal(radar.early_size, 1, 'only the below-floor, non-watchlist protocol is early');
+  assert.equal(radar.board_size, 4, 'the floor changes discovery scope, not board retention');
 });
 
 test('every screened protocol is accounted for, and a watchlist product is flagged not ranked', () => {
